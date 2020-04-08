@@ -1,17 +1,5 @@
 # Surfacing Async Stream Errors to HTTP
 
-Michael Rawlings
-Marko doesn't do anything specific at the http level since right now the api is rendering to a stream (usually an http response, but could be something like an fs write stream). For errors that aren't handled by `<await>`'s `<@catch>`, an error event is emitted on the stream. But for caught errors, I'm not sure what the best course of action is here. Should marko handle closing the stream or should it emit a caught-error event so that the application can do the right thing based on the protocol?
-
-It's a little strange too because in the case of a caught error we want to finish rendering the page and send it, but we may still want to signal to the browser that something went wrong.
-
-Michael Rawlings
-
-
-Taylor Hunt
-and I guess Marko's whole reason for being is efficiently rendering HTML
-which is why you probably shouldn't use it for, say, emitting `text/event-stream` or WebSockets
-
 ## Intro
 
 > A _short_ explanation of the proposal.
@@ -59,9 +47,9 @@ No machine-readable indicator that the streamed response contains erroneous cont
 
 - A search engine will index the erroneous content, since they received no sign they should try again or discard the response as invalid
 
-- HTTP-level tools (debuggers, curl, spiders, etc.) will report the response as successful, even when it wasn’t
+- HTTP-level tools (debuggers, monitoring, curl, spiders, etc.) will report the response as successful, even when it wasn’t
 
-Research into HTTP/1.1’s chunked `Transfer-Encoding` and HTTP/2’s stream error handling found that they both have a standardized way of indicating a dynamically-streamed response failed to complete successfully:
+Research into HTTP/1.1’s chunked responses and HTTP/2’s stream error handling found that they both have a standardized way of indicating a dynamically-streamed response failed to complete successfully:
 
 <dl>
   <dt>HTTP/1.1 <code>Transfer-Encoding: chunked</code></dt>
@@ -79,8 +67,10 @@ This proposal explores how Marko should surface errors from server components to
 
 Developers should be able to tell Marko how important an async error is:
 
-1. Our example from the Motivation section is as serious as it gets — you might even want to redirect to a completely different error page 
-2. Smaller partials in a larger page may still want to tell proxies and search engines that the response is incomplete, but the user might find value in the rest of the page around the `<@error>`
+1. Our example from the Motivation section is as serious as it gets — you might even want to redirect to a completely different error page
+
+2. Smaller partials in a larger page may still want to tell proxies and search engines that the response is incomplete, but the user might find value in the rest of the page around the `<@catch>`
+
 3. You might not care at all for trivial parts of the page, like pulling weather data to change the background image or something
 
 > Explain the proposal as if it was already implemented and you are now teaching it to another Marko developer. That generally means:
@@ -103,7 +93,7 @@ Developers should be able to tell Marko how important an async error is:
 > - Corner cases are dissected by example.
 > - The section should return to the examples given in the previous section, and explain more fully how the detailed proposal makes those examples work.
 
-It is out of scope for this mechanism to surface anything other than runtime errors — mostly because that’s the only semantic we can surface through either version of HTTP. It would be wrong to use this for a 404 page, for example.
+It is out of scope for this mechanism to surface anything other than runtime (`5XX`) errors — mostly because that’s the only semantic we can surface through either version of HTTP. It would be wrong to use this for a 404 page, for example.
 
 ### Trailers
 
@@ -125,13 +115,9 @@ However, note that over HTTP/1.1, trailers can only be appended _after_ the zero
 
 ### HTTP/1.1 considerations
 
-To avoid performance problems with `keepalive` connections, it is probably not wise to explicitly call `.close()` — instead, the streamed HTML response should finish without ever sending the zero-length chunk terminator.
+We should only close the TCP socket sans chunk terminator once we’re done rendering the page. Closing a warmed-up HTTP/1.1 connection is wasteful performance-wise, but there’s no other option here.
 
-But does that mean that kept-alive connection never gets reused by the client, therefore blocking other resources from getting sent over it?
-
-Maybe we should `.close()` the connection only once we know we’re done rendering the page.
-
-The spec also indicates a `Transfer-Encoding` decode error also marks the message as incomplete; a chunk with a _negative_ integer length might trigger that behavior? Or any other data that isn’t a positive hex integer.
+The spec also indicates a `Transfer-Encoding` decode error also marks the message as incomplete; a chunk with a _negative_ integer length might trigger that behavior? Or anything that isn’t a positive hex integer.
 
 A chunk that’s displaying the contents of a `<@catch>` error message may also encode error information as [chunk extensions](https://tools.ietf.org/html/rfc7230#section-4.1.1). I wonder if there’s any standards or _de facto_ implementations that leverage these?
 
@@ -146,6 +132,16 @@ However, those signals indicate a retry is safe even if the request semantics we
 > A server MUST NOT indicate that a stream has not been processed unless it can guarantee that fact. If frames that are on a stream are passed to the application layer for any stream, then `REFUSED_STREAM` MUST NOT be used for that stream, and a `GOAWAY` frame MUST include a stream identifier that is greater than or equal to the given stream identifier.
 
 Still, we might provide a way for Marko authors to signal this safe-to-retry information — the application may be allowed to reason about errors within its own layer.
+
+### SPDY considerations
+
+Some CDNs, like Akamai, translate backend responses to SPDY when talking to older clients. Luckily, SPDY’s semantics more or less map to HTTP/2’s: see [IETF draft: SPDY Protocol §2.4.2. Stream error handling](https://tools.ietf.org/id/draft-mbelshe-httpbis-spdy-00.txt).
+
+[The hex code for `INTERNAL_ERROR` might be `0x6` instead](https://www.chromium.org/spdy/spdy-protocol/spdy-protocol-draft2#TOC-RST_STREAM), but that seems easy and obvious enough to expect transformers to handle it.
+
+### HTTP/… 3
+
+[It’s going to happen eventually.](https://quicwg.org/base-drafts/draft-ietf-quic-http.html#errors)
 
 ### Signaling within Node
 
@@ -169,13 +165,14 @@ Presumably-helpful parts of the API:
 
 ### HTTP ecosystem considerations
 
-It should be possible for developers to selectively turn this error-signaling behavior off, in the case of misbehaving proxies or known-bad clients.
+It should be possible for developers to selectively turn off this error-signaling behavior on a per-request basis, in case of misbehaving proxies or known-bad clients.
 
-Research needed into how common reverse proxies or load balancers, such as nginx, handle error-signaled HTTP streams. Real-world examples of how that can happen: https://rhodesmill.org/brandon/2013/chunked-wsgi/ (including the comment at the very bottom)
+Research needed into how common reverse proxies or load balancers, such as nginx, handle error-signaled HTTP streams:
 
-https://rijulaggarwal.wordpress.com/2018/01/10/atmosphere-long-polling-on-nginx-chunked-encoding-error/
+- [Real-world examples of how that can happen, including the comment at the very bottom](https://rhodesmill.org/brandon/2013/chunked-wsgi/)
+- [Atmosphere long-polling on nginx – chunked encoding error](https://rijulaggarwal.wordpress.com/2018/01/10/atmosphere-long-polling-on-nginx-chunked-encoding-error/)
 
-In the common case of the backend speaking HTTP/1.1 to a reverse proxy/front-end terminator/CDN/etc. that translates to HTTP/2 for browsers, what can be done?
+In the common case of a backend speaking HTTP/1.1 to a reverse proxy/front-end terminator/CDN/etc. that translates to HTTP/2 for browsers, what can be done?
 
 ## Migration strategy
 
@@ -185,7 +182,7 @@ In the common case of the backend speaking HTTP/1.1 to a reverse proxy/front-end
 
 ## Drawbacks
 
-So far, Marko is totally agnostic as to what kind of stream it’s outputting to. You could use it to stream to a file, or something really unexpected like an FTP stream transmission or a chat protocol.
+So far, Marko is totally agnostic as to what kind of stream it’s outputting to. You could use it to stream to a file, a UNIX pipe, or something really unexpected like an FTP stream transmission or a chat protocol.
 
 It’s possible the server runtime might expose a different method to avoid breaking such cases, like `template.streamToHttp()`.
 
@@ -195,36 +192,32 @@ However, there’s already a lot about Marko’s server rendering that only make
 
 The impact of not doing this would be no change; we would continue exposing Marko authors to the risks mentioned in the Motivation section.
 
-In the past, browsers other than Internet Explorer accepted `multipart/x-mixed-replace` responses to be loaded in `target="_top"`, and that could potentially be used to swap to a a new copy of the response-in-progress but with error-indicating headers, or potentially even a replacement error page. However, modern browsers have quietly dropped support for `multipart/x-mixed-replace` in the top browsing context.
+In the past, browsers other than Internet Explorer accepted `multipart/x-mixed-replace` responses to be loaded in `target="_top"`, and that could potentially be used to swap to a new copy of the response-in-progress but with error-indicating headers, or even a replacement error page. However, modern browsers have quietly dropped support for `multipart/x-mixed-replace` in the top browsing context.
 
-It _might_ be possible to write `<meta http-equiv="refresh" content="0;url=${errorPageLocation}">`. It’s not _supposed_ to be outside the `<head>`, but I still like it better than how Rails creates a mid-stream error redirect with an inline `<script>`. ([some context on how search engines could better understand this is a temporary redirect, not a permanent one](https://twitter.com/JohnMu/status/969486943351394304))
+It _might_ be possible to write `<meta http-equiv="refresh" content="0;url=${errorPageLocation}">`. It’s not _supposed_ to be outside the `<head>`, but I still like it better than an error redirect via inline `<script>`. ([some context on how search engines could better understand this is a temporary redirect, not a permanent one](https://twitter.com/JohnMu/status/969486943351394304))
 
 
 ## Prior art
 
-[You used to have to delay a bit before closing a connection without the zero-length terminator because of this Chrome bug](https://bugs.chromium.org/p/chromium/issues/detail?id=610126)
+How to signal errors during a dynamic HTTP stream is not unique to Marko; the problem is very old. Other server runtimes and frameworks may have paved this cowpath already.
 
-https://stackoverflow.com/questions/17203379/response-sent-in-chunked-transfer-encoding-and-indicating-errors-happening-after
-
-The issue of signaling errors that occur during a dynamic HTTP stream is not specific to Marko; the problem is very old. Other server runtimes and frameworks may have paved this cowpath already. Some candidates widely-used enough to probably have built-in behavior or guidance:
-
+- [You used to have to delay a bit before closing a connection without the zero-length terminator because of this Chrome bug](https://bugs.chromium.org/p/chromium/issues/detail?id=610126)
+- [StackOverflow / Response sent in chunked transfer encoding and indicating errors happening after some data has already been sent](https://stackoverflow.com/questions/17203379/response-sent-in-chunked-transfer-encoding-and-indicating-errors-happening-after)
 - Express and other Node HTTP frameworks
-    - https://expressjs.com/en/guide/error-handling.html#the-default-error-handler
-    - https://github.com/expressjs/express/issues/2700 (!!!)
-    - https://zellwk.com/blog/express-errors/#when-streaming
-    - https://stackoverflow.com/questions/21509233/error-handling-in-express-while-piping-stream-to-response
+    - [expressjs/express #2700: Abort a streaming response.](https://github.com/expressjs/express/issues/2700)
+    - [Handling Errors in Express § When streaming](https://zellwk.com/blog/express-errors/#when-streaming)
+    - [StackOverflow / Error handling in express while piping stream to response](https://stackoverflow.com/questions/21509233/error-handling-in-express-while-piping-stream-to-response)
+    - [Express Guide / Error Handling § The default error handler](https://expressjs.com/en/guide/error-handling.html#the-default-error-handler)
 - PHP’s output buffers and its `flush()` family of functions
-    - https://stackoverflow.com/questions/29894154/chrome-neterr-incomplete-chunked-encoding-error (good lord the answers all reveal a lot of ways this can happen)
-- Java JSPs, or its various frameworks
-    - https://techblog.bozho.net/error-pages-and-chunked-encoding-its-harder-than-you-think/
+    - [StackOverflow / Chrome net::ERR_INCOMPLETE_CHUNKED_ENCODING error](https://stackoverflow.com/questions/29894154/chrome-neterr-incomplete-chunked-encoding-error) (good lord the answers all reveal a lot of ways this can happen)
+- [Error pages and chunked encoding – it’s harder than you think](https://techblog.bozho.net/error-pages-and-chunked-encoding-its-harder-than-you-think/)
 - Ruby on Rails
-    - https://api.rubyonrails.org/classes/ActionController/Streaming.html#module-ActionController::Streaming-label-Errors
-    - https://weblog.rubyonrails.org/2011/4/18/why-http-streaming/
+    - [Rails API / `ActionController::Streaming` § Errors](https://api.rubyonrails.org/classes/ActionController/Streaming.html#module-ActionController::Streaming-label-Errors)
+    - [rails/…/action_view/base.rb § `:streaming_completion_on_exception`](https://github.com/rails/rails/blob/7729b518f37740a0b2d3bfe8c53ed55dd7548d8b/actionview/lib/action_view/base.rb#L147-L149)
 - Perl may be the most interesting of all, as it was widely-used during the migration to HTTP/1.1 — HTTP/1.0 notoriously couldn’t tell the difference between the server finishing a dynamic response or the connection being closed for other reasons.
 - [Django basically discourages streaming altogether](https://docs.djangoproject.com/en/3.0/ref/request-response/#django.http.StreamingHttpResponse)
-- https://rhodesmill.org/brandon/2013/chunked-wsgi/
-- https://www.oreilly.com/library/view/http-the-definitive/1565925092/ch04s07.html
-- https://web.archive.org/web/20150114012656/http://blogs.msdn.com/b/aspnetue/archive/2010/05/25/response-end-response-close-and-how-customer-feedback-helps-us-improve-msdn-documentation.aspx
+- This is worth its weight in gold, even the comments: [WSGI and truncated chunked response bodies](https://rhodesmill.org/brandon/2013/chunked-wsgi/)
+- [HTTP: The Definitive Guide / The Mysteries of Connection Close](https://www.oreilly.com/library/view/http-the-definitive/1565925092/ch04s07.html)
 
 ## Unresolved questions
 
