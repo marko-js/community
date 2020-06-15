@@ -1,4 +1,4 @@
-# Surfacing Async Stream Errors to HTTP
+# Surfacing Stream Errors to HTTP
 
 ## Intro
 
@@ -6,9 +6,9 @@
 
 ## Motivation
 
-Marko already has a way to tell _humans_ that the promise for an `<await>` rejected: the `<@catch>` block. Unfortunately, for machines, the original HTTP status code is how they determine the error state of a response — and the HTTP headers are already sent by the time an `<await>` errors.
+Marko already has a way to tell _humans_ that the promise for an `<await>` rejected: the `<@catch>` block. Unfortunately for machines, the original HTTP status code is how they know the error state of a response — and the HTTP headers are already sent by the time an `<await>` errors.
 
-Say we have Marko render the page’s `<head>` and the site logo/navigation/searchbar while the Node server calls a backend API to populate the page content:
+Say we have Marko render a page’s `<head>` and site banner while the Node server calls a backend API for the content:
 
 ```marko
 <!doctype html>
@@ -37,19 +37,17 @@ Say we have Marko render the page’s `<head>` and the site logo/navigation/sear
 </html>
 ```
 
-This is great for the user because their browser gets a head start downloading assets linked in the `<head>` and displaying the site header while the network request to the content API is underway.
+This is great for the user because their browser gets a head start downloading assets in the `<head>` and displays the site header while the network request to the content API is underway.
 
-However, if the `contentFetchRequest` fails for any of the myriad reasons computers are terrible, the page will show an error message instead of its real content — but as far as the HTTP layer knows, the response completed successfully.
+If the `contentFetchRequest` fails for any of the myriad reasons computers are terrible, the page will show an error message instead — but as far as the HTTP layer knows, the response completed successfully.
 
-No machine-readable indicator that the streamed response contains erroneous content causes some thorny problems:
+No machine-readable indicator that a streamed response contains erroneous content causes some thorny problems:
 
-- An HTTP cache may store the erroneous content and reuse it, causing users to see the error for longer than they otherwise would
+- An HTTP cache may store the erroneous content and reuse it, showing users the error for longer than they otherwise would
+- Search engines will index the erroneous content, since they received no sign they should try again or discard the response as invalid
+- HTTP-level tools (debuggers, monitoring, curl, spiders, etc.) will report the response as successful, even though it wasn’t
 
-- A search engine will index the erroneous content, since they received no sign they should try again or discard the response as invalid
-
-- HTTP-level tools (debuggers, monitoring, curl, spiders, etc.) will report the response as successful, even when it wasn’t
-
-Research into HTTP/1.1’s chunked responses and HTTP/2’s stream error handling found that they both have a standardized way of indicating a dynamically-streamed response failed to complete successfully:
+HTTP/1.1’s chunked responses and HTTP/2’s stream error handling each have a standardized way of indicating a dynamic response failed to complete successfully:
 
 <dl>
   <dt>HTTP/1.1 <code>Transfer-Encoding: chunked</code></dt>
@@ -61,17 +59,17 @@ Research into HTTP/1.1’s chunked responses and HTTP/2’s stream error handlin
   <dd><p>An HTTP/2 stream can signal an application error by sending a <code>RST_STREAM</code> frame with an error code of <code>0x2 INTERNAL_ERROR</code>.</p></dd>
 </dl>
 
-This proposal explores how Marko should surface errors from server components to the HTTP layer, so the response can properly signal an error with one of the above methods.
+This proposal explores how Marko should surface errors from its components to the HTTP layer, so the response can properly signal an error with one of the above methods.
 
 ## Guide-level explanation
 
 Developers should be able to tell Marko how important an async error is:
 
-1. Our example from the Motivation section is as serious as it gets — you might even want to redirect to a completely different error page
+1. Our example from the Motivation section is as serious as it gets
 
-2. Smaller partials in a larger page may still want to tell proxies and search engines that the response is incomplete, but the user might find value in the rest of the page around the `<@catch>`
+2. Small partials in a page may still want to tell proxies and search engines that the response is incomplete, but the user might find value in the rest of the page around the `<@catch>`
 
-3. You might not care at all for trivial parts of the page, like pulling weather data to change the background image or something
+3. Maybe no problem at all for trivial parts of the page, like pulling weather data to change a background image
 
 > Explain the proposal as if it was already implemented and you are now teaching it to another Marko developer. That generally means:
 > 
@@ -83,6 +81,8 @@ Developers should be able to tell Marko how important an async error is:
 > For implementation-oriented proposals, this section should focus on how contributors should think about the change, and give examples of its concrete impact. For policy proposals, this section should provide an example-driven introduction to the policy, and explain its impact in concrete terms.
 
 > Would the acceptance of this proposal mean the Marko docs must be re-organized or altered?
+
+No, but a page about this problem may be a good addition.
 
 ## Reference-level explanation
 
@@ -97,27 +97,27 @@ It is out of scope for this mechanism to surface anything other than runtime (`5
 
 ### Trailers
 
-We should send error information in HTTP trailers if any clients would benefit. [Some browsers have traditionally discarded almost all trailers other than `Server-Timing`](https://www.fastly.com/blog/supercharging-server-timing-http-trailers), but other browsers, tools like `curl`, search engines, proxy caches, and debuggers may benefit. For example, an updated `Cache-Control`, `Retry-After`, or even `Refresh`ing to an error page at a new URL if the problem was serious enough.
+⚠️ **At-risk:** This section may not work at all, since trailers can only be appended _after_ the zero-length terminator chunk in HTTP/1.1, and presumably after the error frame in HTTP/2.
+
+We could send error information in HTTP trailers if any clients would benefit. [Some browsers have traditionally discarded almost all trailers other than `Server-Timing`](https://www.fastly.com/blog/supercharging-server-timing-http-trailers), but other browsers, tools like `curl`, search engines, proxy caches, and debuggers may benefit. For example, an updated `Cache-Control`, `Retry-After`, or even `Refresh`ing to an error page at a new URL if the problem was serious enough.
 
 Even for stricter browsers, error information inside `Server-Timing` could help developers, as many monitoring tools track, expose, and alert information from this header.
 
 ```
-Server-Timing: markoAsyncErr; dur=87.1; desc="${errorInfo}"
+Server-Timing: markoAwaitErr; dur=87.1; desc="${errorInfo}"
 ```
 
 What information should be exposed this way?
 
 - The `dur` field is standardized as indicating how far along the event happened in the request
 - The `desc` field is any string the developer wishes 
-- Multiple Server-Timing events are allowed with the same name, so Marko could emit it repeatedly in the case of multiple async failures, with `desc` disambiguating what happened and where
-
-However, note that over HTTP/1.1, trailers can only be appended _after_ the zero-length terminator chunk. Hmm.
+- Multiple Server-Timing events are allowed with the same name, so Marko could emit it repeatedly for multiple async failures, with `desc` disambiguating what happened and where
 
 ### HTTP/1.1 considerations
 
-We should only close the TCP socket sans chunk terminator once we’re done rendering the page. Closing a warmed-up HTTP/1.1 connection is wasteful performance-wise, but there’s no other option here.
+We should only close the TCP socket sans chunk terminator once we’re done rendering the page. Closing a warmed-up HTTP/1.1 connection is wasteful performance-wise, but there’s no other option.
 
-The spec also indicates a `Transfer-Encoding` decode error also marks the message as incomplete; a chunk with a _negative_ integer length might trigger that behavior? Or anything that isn’t a positive hex integer.
+The spec also says a `Transfer-Encoding` decode error marks the message as incomplete; a chunk with a _negative_ integer length might trigger that behavior? Or anything that isn’t a positive hex integer.
 
 A chunk that’s displaying the contents of a `<@catch>` error message may also encode error information as [chunk extensions](https://tools.ietf.org/html/rfc7230#section-4.1.1). I wonder if there’s any standards or _de facto_ implementations that leverage these?
 
@@ -174,15 +174,19 @@ Research needed into how common reverse proxies or load balancers, such as nginx
 
 In the common case of a backend speaking HTTP/1.1 to a reverse proxy/front-end terminator/CDN/etc. that translates to HTTP/2 for browsers, what can be done?
 
+This part is probably out of scope for Marko itself, but could be invaluable guidance to help developers figure out what to do with an `error` event on a Marko stream.
+
 ## Migration strategy
 
 > Is this proposal backwards incompatible? Does this proposal replace an existing feature/pattern? If so, can we safely and automatically migrate existing apps/components to this proposal? How?
+
+This proposal may change nothing about Marko at all, but instead surface developer advice.
 
 > If applicable, provide sample error messages, deprecation warnings, or migration guidance.
 
 ## Drawbacks
 
-So far, Marko is totally agnostic as to what kind of stream it’s outputting to. You could use it to stream to a file, a UNIX pipe, or something really unexpected like an FTP stream transmission or a chat protocol.
+So far, Marko is totally agnostic as to the kind of stream it outputs to. You can use it to stream to a file, a UNIX pipe, or something unexpected like an FTP transmission or a chat protocol.
 
 It’s possible the server runtime might expose a different method to avoid breaking such cases, like `template.streamToHttp()`.
 
@@ -193,9 +197,6 @@ However, there’s already a lot about Marko’s server rendering that only make
 The impact of not doing this would be no change; we would continue exposing Marko authors to the risks mentioned in the Motivation section.
 
 In the past, browsers other than Internet Explorer accepted `multipart/x-mixed-replace` responses to be loaded in `target="_top"`, and that could potentially be used to swap to a new copy of the response-in-progress but with error-indicating headers, or even a replacement error page. However, modern browsers have quietly dropped support for `multipart/x-mixed-replace` in the top browsing context.
-
-It _might_ be possible to write `<meta http-equiv="refresh" content="0;url=${errorPageLocation}">`. It’s not _supposed_ to be outside the `<head>`, but I still like it better than an error redirect via inline `<script>`. ([some context on how search engines could better understand this is a temporary redirect, not a permanent one](https://twitter.com/JohnMu/status/969486943351394304))
-
 
 ## Prior art
 
@@ -221,4 +222,6 @@ How to signal errors during a dynamic HTTP stream is not unique to Marko; the pr
 
 ## Unresolved questions
 
-> Optional, but suggested for first drafts. What parts of the design are still TBD?
+1. How should Marko devs indicate an `<await>` error is serious or not? Re-throwing the `Error` inside `<@catch>`? It seems like a bad idea to have errors default to cacheable, instead of the opposite.
+
+2. Can Marko even write garbage data to the HTTP stream at its layer?
